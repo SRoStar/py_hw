@@ -8,10 +8,17 @@ def get_information(name, element, num):
     Chrome/55.0.2883.87 Safari/537.36'}
     r = requests.get(url, headers=headers)
     hjson = json.loads(r.text)
-    element.melting_point = hjson[num]['melt']
+    # 稀有气体没有熔点
+    try:
+        element.melting_point = hjson[num]['melt']
+    except:
+        element.melting_point = 'N/A'
     element.boiling_point = hjson[num]['boil']
     element.crust = hjson[num]["abundance"]['crust']
-    element.meteor = hjson[num]["abundance"]['meteor']
+    try:
+        element.meteor = hjson[num]["abundance"]['meteor']
+    except:
+        element.meteor = 'N/A'
     element.ocean = hjson[num]["abundance"]['ocean']
     element.solar = hjson[num]["abundance"]['solar']
     element.universe = hjson[num]["abundance"]['universe']
