@@ -65,7 +65,7 @@ parser.add_argument('--world-size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='tcp://127.0.0.1:23459', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')  # 分布式后端提供了实现分布式训练的功能和工具
@@ -82,8 +82,7 @@ parser.add_argument('--dummy', action='store_true',
                     help="use fake data to benchmark")  # 使用虚拟数据进行基准测试 基准测试是评估算法、模型或系统性能的一种方法
 
 best_acc1 = 0
-output_dir = os.path.join("..", "output", "logs", "runs")
-writer = SummaryWriter(output_dir)
+writer = 0
 
 
 def main():
@@ -108,7 +107,10 @@ def main():
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed  # 进程数量大于1或根据设置 进行分布式训练
 
-    ngpus_per_node = 1
+    if torch.cuda.is_available():
+        ngpus_per_node = torch.cuda.device_count()  # 检查当前系统是否支持CUDA，
+    else:
+        ngpus_per_node = 1
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
@@ -124,6 +126,8 @@ def main():
 def main_worker(gpu, ngpus_per_node, args):  # 主要训练函数
     global best_acc1
     global writer
+    output_dir = os.path.join("..", "output", "logs", "runs", str(gpu))
+    writer = SummaryWriter(output_dir)
 
     args.gpu = gpu
 
@@ -147,7 +151,50 @@ def main_worker(gpu, ngpus_per_node, args):  # 主要训练函数
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
-    device = torch.device("cpu")
+    if not torch.cuda.is_available() and not torch.backends.mps.is_available():  # 后者检查系统是否支持CUDA的多进程模式（MPS）
+        print('using CPU, this will be slow')
+    elif args.distributed:
+        # For multiprocessing distributed, DistributedDataParallel constructor
+        # should always set the single device scope, otherwise, 确保构造函数中设置了单个设备范围
+        # DistributedDataParallel will use all available devices.
+        if torch.cuda.is_available():
+            if args.gpu is not None:
+                torch.cuda.set_device(args.gpu)
+                model.cuda(args.gpu)  # 将模型移动到指定的GPU设备上
+                # When using a single GPU per process and per
+                # DistributedDataParallel, we need to divide the batch size
+                # ourselves based on the total number of GPUs of the current node.
+                args.batch_size = int(args.batch_size / ngpus_per_node)
+                args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+                model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])  # 对模型进行封装
+            else:
+                model.cuda()
+                # DistributedDataParallel will divide and allocate batch_size to all
+                # available GPUs if device_ids are not set
+                model = torch.nn.parallel.DistributedDataParallel(model)
+    elif args.gpu is not None and torch.cuda.is_available():  # 非分布式，指定gpu
+        torch.cuda.set_device(args.gpu)
+        model = model.cuda(args.gpu)
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        model = model.to(device)
+    else:
+        # DataParallel will divide and allocate batch_size to all available GPUs
+        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
+            model.features = torch.nn.DataParallel(model.features)
+            model.cuda()
+        else:
+            model = torch.nn.DataParallel(model).cuda()
+
+    if torch.cuda.is_available():
+        if args.gpu:
+            device = torch.device('cuda:{}'.format(args.gpu))
+        else:  # 没指定的话默认为第一个
+            device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().to(device)  # 创建一个交叉熵损失函数对象并将其移动到指定的设备上进行计算
 
@@ -246,10 +293,6 @@ def main_worker(gpu, ngpus_per_node, args):  # 主要训练函数
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    dataiter = iter(train_loader)
-    images, labels = next(dataiter)
-    writer.add_graph(model, images)
-    writer.flush()
     if args.evaluate:  # 评估模式
         validate(val_loader, model, criterion, args)
         return
@@ -355,6 +398,14 @@ def validate(val_loader, model, criterion, args, epoch=0):
             running_accu = 0.0
             for i, (images, target) in enumerate(loader):
                 i = base_progress + i
+                if args.gpu is not None and torch.cuda.is_available():
+                    images = images.cuda(args.gpu, non_blocking=True)  # 移动到相应设备
+                if torch.backends.mps.is_available():
+                    images = images.to('mps')
+                    target = target.to('mps')
+                if torch.cuda.is_available():
+                    target = target.cuda(args.gpu, non_blocking=True)
+
                 # compute output
                 output = model(images)
                 loss = criterion(output, target)
@@ -447,7 +498,12 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
     def all_reduce(self):
-        device = torch.device("cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         total = torch.tensor([self.sum, self.count], dtype=torch.float32, device=device)
         dist.all_reduce(total, dist.ReduceOp.SUM, async_op=False)
         self.sum, self.count = total.tolist()
